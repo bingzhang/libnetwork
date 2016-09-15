@@ -948,13 +948,45 @@ func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo,
 		return err
 	}
 
+	// Watch for link changes
+	notifyLink := make(chan netlink.LinkUpdate)
+	notifyDone := make(chan struct{})
+	netlink.LinkSubscribe(notifyLink, notifyDone)
+
 	// Generate and add the interface pipe host <-> sandbox
 	veth := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{Name: hostIfName, TxQLen: 0},
 		PeerName:  containerIfName}
 	if err = d.nlh.LinkAdd(veth); err != nil {
+		close(notifyDone)
 		return types.InternalErrorf("failed to add the host (%s) <=> sandbox (%s) pair interfaces: %v", hostIfName, containerIfName, err)
 	}
+
+	// Do not continue until the interfaces are running, to avoid race conditions
+	hostRunning := false
+	containerRunning := false
+	for {
+		update, more := <-notifyLink
+		if ! more {
+			logrus.Warnf("LinkSubscribe channel unexpectedly closed")
+			break
+		}
+		if update.Header.Type == syscall.RTM_NEWLINK &&
+			update.IfInfomsg.Flags & syscall.IFF_RUNNING != 0 {
+			if update.Link.Attrs().Name == hostIfName {
+				logrus.Debugf("LinkSubscribe notified %s is running", hostIfName)
+				hostRunning = true
+			}
+			if update.Link.Attrs().Name == containerIfName {
+				logrus.Debugf("LinkSubscribe notified %s is running", containerIfName)
+				containerRunning = true
+			}
+			if hostRunning && containerRunning {
+				break
+			}
+		}
+	}
+	close(notifyDone)
 
 	// Get the host side pipe interface handler
 	host, err := d.nlh.LinkByName(hostIfName)
